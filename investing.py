@@ -1,9 +1,8 @@
-import urllib
 import urllib.request
 from urllib.error import HTTPError
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
-import datetime
 import arrow
 
 
@@ -31,11 +30,38 @@ class Unknow():
 		self.name = "unknow"
 
 	def __repr__(self):
-		return "<Unknow(value='%s')>" % (self.value)		
+		return "<Unknow(value='%s')>" % (self.value)
 
 
 class Investing():
-	def __init__(self, uri='http://ru.investing.com/economic-calendar/'):
+	"""Parse the economic calendar.
+
+	investing.com now returns HTTP 403 for every request (even with a
+	regular browser User-Agent), so it can no longer be scraped this way.
+	This class targets the equivalent calendar published by
+	tradingeconomics.com instead, which is still reachable with a plain
+	HTTP GET.
+	"""
+
+	BASE_URL = 'https://pt.tradingeconomics.com'
+
+	def __init__(self, uri=None, country=None, importance=None):
+		"""
+		uri: full calendar URL to scrape. When omitted it is built from
+			`country` and `importance`.
+		country: optional country slug (e.g. 'brazil', 'united-states')
+			to fetch a single country's calendar
+			(https://pt.tradingeconomics.com/<country>/calendar).
+		importance: optional impact filter, only supported on the
+			all-countries calendar (i.e. when `country` is not set):
+			'1' (low), '2' (medium) or '3' (high impact).
+		"""
+		if uri is None:
+			path = '/{}/calendar'.format(country) if country else '/calendar'
+			uri = urljoin(self.BASE_URL, path)
+			if importance and not country:
+				uri = '{}?importance={}'.format(uri, importance)
+
 		self.uri = uri
 		self.req = urllib.request.Request(uri)
 		self.req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36')
@@ -44,106 +70,73 @@ class Investing():
 	def news(self):
 		try:
 			response = urllib.request.urlopen(self.req)
-			
+
 			html = response.read()
-			
+
 			soup = BeautifulSoup(html, "html.parser")
 
-			# Find event item fields
-			table = soup.find('table', {"id": "economicCalendarData"})
-			tbody = table.find('tbody')
-			rows = tbody.findAll('tr', {"class": "js-event-item"})
-
-			news = {'timestamp': None,
-					'country': None,
-					'impact': None,
-					'url': None,
-					'name': None,
-					'bold': None,
-					'fore': None,
-					'prev': None,
-					'signal': None,
-					'type': None}
-			
-			for row in rows:
-				#print (row.attrs['data-event-datetime'])
-				_datetime = row.attrs['data-event-datetime']
-				news['timestamp'] = arrow.get(_datetime, "YYYY/MM/DD HH:mm:ss").timestamp
+			# Find event item rows. Nested tables (flags, sparkline
+			# charts) are skipped because their <tr> have no data-url.
+			table = soup.find('table', {"id": "calendar"})
+			rows = table.find_all('tr', attrs={"data-url": True})
 
 			for tr in rows:
-				cols = tr.find('td', {"class": "flagCur"})
-				flag = cols.find('span')
+				news = {'timestamp': None,
+						'country': None,
+						'url': None,
+						'name': None,
+						'bold': None,
+						'fore': None,
+						'prev': None,
+						'signal': None}
 
-				news['country'] = flag.get('title')
+				cells = tr.find_all('td', recursive=False)
+				date_cell, country_cell, event_cell, actual_cell, prev_cell = cells[0:5]
 
-				impact = tr.find('td', {"class": "sentiment"})
-				bull = impact.findAll('i', {"class": "grayFullBullishIcon"})
+				# Date comes from the cell class (e.g. "2026-09-08"),
+				# time from the text inside it (e.g. "12:30 AM").
+				date = next(iter(date_cell.get('class', [])), None)
+				time = date_cell.get_text(strip=True)
+				if date and time:
+					try:
+						news['timestamp'] = arrow.get("{} {}".format(date, time), "YYYY-MM-DD h:mm A").timestamp()
+					except arrow.parser.ParserError:
+						pass
 
-				news['impact'] = len(bull)
+				flag = country_cell.find('div', {"class": "flag"})
+				news['country'] = flag.get('title') if flag else tr.get('data-country')
 
-				event = tr.find('td', {"class": "event"})
-				a = event.find('a')
+				news['url'] = urljoin(self.BASE_URL, tr.get('data-url', ''))
 
-				news['url'] = "{}{}".format(self.uri, a['href'])
-				news['name'] = a.text.strip()
+				link = event_cell.find('a', {"class": "calendar-event"})
+				news['name'] = link.get_text(strip=True) if link else tr.get('data-event')
 
-				# Determite type of event
-				legend = event.find('span', {"class": "smallGrayReport"})
-				if legend:
-					news['type'] = "report"
+				actual = actual_cell.find(id='actual')
+				news['bold'] = actual.get_text(strip=True) if actual else ''
 
-				legend = event.find('span', {"class": "audioIconNew"})
-				if legend:
-					news['type'] = "speech"
+				prev = prev_cell.find(id='previous')
+				news['prev'] = prev.get_text(strip=True) if prev else ''
 
-				legend = event.find('span', {"class": "smallGrayP"})
-				if legend:
-					news['type'] = "release"
-				
-				legend = event.find('span', {"class": "sandClock"})
-				if legend:
-					news['type'] = "retrieving data"					
+				forecast_cell = cells[6] if len(cells) > 6 else None
+				forecast = forecast_cell.find(id='forecast') if forecast_cell else None
+				news['fore'] = forecast.get_text(strip=True) if forecast else ''
 
-
-				bold = tr.find('td', {"class": "bold"})
-
-				if bold.text != '':
-					news['bold'] = bold.text.strip()
-				else:
-					news['bold'] = ''
-
-				fore = tr.find('td', {"class": "fore"})
-				news['fore'] = fore.text.strip()
-
-				prev = tr.find('td', {"class": "prev"})
-				news['prev'] = prev.text.strip()
-
-				if "blackFont" in bold['class']:
-					#print ('?')
-					# news['signal'] = '?'
-					news['signal'] = Unknow()
-
-				elif "redFont" in bold['class']:
-					#print ('-')
-					# news['signal'] = '-'
-					news['signal'] = Bad()
-
-				elif "greenFont" in bold['class']:
-					#print ('+')
-					# news['signal'] = '+'
+				actual_classes = actual_cell.get('class', [])
+				if 'calendar-item-positive' in actual_classes:
 					news['signal'] = Good()
-
+				elif 'calendar-item-negative' in actual_classes:
+					news['signal'] = Bad()
 				else:
 					news['signal'] = Unknow()
 
 				self.result.append(news)
-		
+
 		except HTTPError as error:
-			print ("Oops... Get error HTTP {}".format(error.code))
+			print("Oops... Get error HTTP {}".format(error.code))
 
 		return self.result
 
 
 if __name__ == "__main__":
-	i = Investing('http://investing.com/economic-calendar/')
-	print (i.news())
+	i = Investing(country='brazil')
+	print(i.news())
